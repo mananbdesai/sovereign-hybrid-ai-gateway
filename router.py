@@ -1,105 +1,122 @@
-import asyncio
 import os
-import time
-from enum import Enum
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+import logging
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-from langchain_core.messages import HumanMessage
+# LangChain & AI Imports
+from langchain_community.chat_models import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama
+from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
+# Configure Enterprise Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load Environment Variables (.env)
 load_dotenv()
 
-app = FastAPI(title="Sovereign AI Gateway (Phase 2 - RAG Ready)", version="2.0")
+app = FastAPI(title="Sovereign Hybrid AI Gateway", version="1.4.0")
 
-class DataClassification(str, Enum):
-    CONFIDENTIAL = "CONFIDENTIAL"
-    PUBLIC = "PUBLIC"
+# --- Infrastructure & Governance Configurations ---
+# FinOps: Centralized external model selection defaulting to low-cost tier
+EXTERNAL_MODEL = os.getenv("EXTERNAL_MODEL", "gpt-4o-mini") 
+# Server-Side Governance: Enforce Zero-Trust by default
+ROUTING_POLICY = os.getenv("ROUTING_POLICY", "STRICT_LOCAL") 
 
-class RouterRequest(BaseModel):
-    query: str = Field(..., description="The user prompt or system query.")
-    classification: DataClassification = Field(
-        default=DataClassification.CONFIDENTIAL
-    )
+QDRANT_URL = "http://192.168.0.122:6333"
+OLLAMA_URL = "http://192.168.0.121:11434"
+COLLECTION_NAME = "mainframe_logic"
 
-class HybridModelRouter:
-    def __init__(self):
-        self.routing_policy = os.getenv("ROUTING_POLICY", "STRICT_LOCAL").upper()
-        
-        # 1. Initialize Sovereign LLM
-        self.local_llm = ChatOllama(
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://192.168.0.121:11434"),
-            model=os.getenv("OLLAMA_MODEL", "llama3"),
-            temperature=0.1 
-        )
-        
-        # 2. Initialize Cloud LLM
-        self.cloud_llm = ChatOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o",
-            temperature=0.3
-        )
+# --- Phase 2 & 4: Local Memory (RAG) Initialization ---
+logger.info("Initializing CPU-bound embeddings for RAG...")
+embeddings = HuggingFaceEmbeddings(
+    model_name="all-MiniLM-L6-v2",
+    model_kwargs={'device': 'cpu'} # CRITICAL: Forces execution to CPU, preventing GPU/CUDA crashes
+)
 
-        # 3. Initialize CPU-Forced Embeddings (all-MiniLM-L6-v2)
-        print("\n[INIT] Loading HuggingFace Embeddings (Strictly CPU)...", flush=True)
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}, # GUARANTEES NO GPU CALLS
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        print("[INIT] Embeddings loaded successfully.", flush=True)
+logger.info(f"Connecting to Qdrant Vector DB at {QDRANT_URL}...")
+qdrant_client = QdrantClient(url=QDRANT_URL)
+vector_store = QdrantVectorStore(
+    client=qdrant_client, 
+    collection_name=COLLECTION_NAME, 
+    embedding=embeddings
+)
 
-        # 4. Initialize Qdrant Vector DB Connection
-        qdrant_url = os.getenv("QDRANT_URL", "http://192.168.0.122:6333")
-        print(f"[INIT] Connecting to Qdrant Vector DB at {qdrant_url}...", flush=True)
-        try:
-            self.qdrant = QdrantClient(url=qdrant_url)
-            # Test connection by listing collections
-            collections = self.qdrant.get_collections()
-            print(f"[INIT] Qdrant connected. Existing collections: {collections.collections}", flush=True)
-        except Exception as e:
-            print(f"[INIT ERROR] Failed to connect to Qdrant: {e}", flush=True)
+# --- LLM Client Instantiation ---
+local_llm = ChatOllama(base_url=OLLAMA_URL, model="llama3", temperature=0.1)
+public_llm = ChatOpenAI(model=EXTERNAL_MODEL, temperature=0.7)
 
-    async def process_query(self, request: RouterRequest) -> dict:
-        messages = [HumanMessage(content=request.query)]
-        start_time = time.time()
-        
-        print(f"\n[GATEWAY] Received query: '{request.query}'", flush=True)
+# --- Prompt Engineering (Phase 4) ---
+# We force the LLM to answer STRICTLY based on the retrieved COBOL context
+SOVEREIGN_PROMPT_TEMPLATE = """
+You are an Enterprise AI Architect assisting with Mainframe modernization.
+You have been provided with the following highly confidential legacy COBOL code snippets.
 
-        route_to_cloud = False
-        if self.routing_policy == "LOCAL_FIRST" or self.routing_policy == "HYBRID":
-            if request.classification == DataClassification.PUBLIC:
-                route_to_cloud = True
+Context:
+{context}
 
-        if route_to_cloud:
-            print("[ROUTING] Action: Sending to Cloud (GPT-4o)...", flush=True)
-            response = await self.cloud_llm.ainvoke(messages)
-            source = "Cloud Endpoint (GPT-4o)"
-        else:
-            print("[ROUTING] Action: Sending to Sovereign Edge (LXC 121)...", flush=True)
-            response = await self.local_llm.ainvoke(messages)
-            source = f"Sovereign Edge (Llama 3 @ 192.168.0.121)"
+Question: {question}
 
-        execution_time = round(time.time() - start_time, 2)
-        print(f"[GATEWAY] Execution Complete: {execution_time}s", flush=True)
-        
-        return {
-            "source": source,
-            "applied_policy": self.routing_policy,
-            "execution_time_seconds": execution_time,
-            "response": response.content
-        }
+Instructions:
+1. Answer the question using ONLY the context provided above.
+2. If the answer is not contained within the context, state "I do not have enough sovereign context to answer this."
+3. Do not use outside knowledge. Do not hallucinate.
+"""
+sovereign_prompt = PromptTemplate(template=SOVEREIGN_PROMPT_TEMPLATE, input_variables=["context", "question"])
 
-router_instance = HybridModelRouter()
+# --- API Payloads ---
+class QueryPayload(BaseModel):
+    prompt: str
+    classification: str # "CONFIDENTIAL" or "PUBLIC"
 
+# --- Centralized Policy Router ---
 @app.post("/v1/query")
-async def process_query_endpoint(request: RouterRequest):
-    try:
-        return await router_instance.process_query(request)
-    except Exception as e:
-        print(f"[ERROR] {str(e)}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
+async def route_query(payload: QueryPayload):
+    logger.info(f"Incoming query. User classification: {payload.classification}. Policy: {ROUTING_POLICY}")
+
+    # Zero-Trust Enforcement: If STRICT_LOCAL is on, force all traffic internally regardless of user payload
+    is_confidential = payload.classification.upper() == "CONFIDENTIAL" or ROUTING_POLICY == "STRICT_LOCAL"
+
+    if is_confidential:
+        logger.info("Routing -> CONFIDENTIAL (LXC 121: Llama 3 via RAG)")
+        try:
+            # 1. Asynchronously Retrieve Top-3 relevant COBOL chunks
+            logger.info("Querying Qdrant for semantic context...")
+            docs = await vector_store.asimilarity_search(payload.prompt, k=3)
+            
+            # 2. Format the context
+            retrieved_context = "\n\n".join([doc.page_content for doc in docs])
+            logger.info(f"Retrieved {len(docs)} chunks from Vector DB.")
+
+            # 3. Inject context into the prompt template
+            final_prompt = sovereign_prompt.format(context=retrieved_context, question=payload.prompt)
+            
+            # 4. Generate Sovereign Answer
+            response = await local_llm.ainvoke(final_prompt)
+            return {
+                "route": "INTERNAL_SOVEREIGN",
+                "model": "llama3",
+                "response": response.content,
+                "chunks_retrieved": len(docs)
+            }
+        except Exception as e:
+            logger.error(f"Internal generation failed: {str(e)}")
+            raise HTTPException(status_code=500, detail="Sovereign AI Node Unavailable.")
+    
+    else:
+        # FinOps & External Routing
+        logger.info(f"Routing -> PUBLIC (Cloud API: {EXTERNAL_MODEL})")
+        try:
+            response = await public_llm.ainvoke(payload.prompt)
+            return {
+                "route": "EXTERNAL_PUBLIC",
+                "model": EXTERNAL_MODEL,
+                "response": response.content
+            }
+        except Exception as e:
+            logger.error(f"Public API call failed: {str(e)}")
+            raise HTTPException(status_code=502, detail="External Cloud API Unavailable.")
