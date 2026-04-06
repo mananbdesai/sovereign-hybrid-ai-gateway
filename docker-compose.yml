@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  ai-gateway:
+    build: .
+    container_name: hybrid-ai-gateway
+    ports:
+      - "8080:8000" # <-- Host Port mapped to 8080 to avoid Portainer conflict
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - default

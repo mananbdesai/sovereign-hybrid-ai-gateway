@@ -1,0 +1,15 @@
+# Python Environment
+venv/
+__pycache__/
+*.pyc
+
+# Security & Secrets
+.env
+
+# Sovereign Data Boundary (CRITICAL)
+# Do NOT commit proprietary COBOL, PII, or internal architecture docs
+data/
+*.cbl
+*.cob
+*.cpy  # COBOL Copybooks (contains proprietary data structures)
+*.jcl  # Job Control Language (contains infrastructure execution logic)
